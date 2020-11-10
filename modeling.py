@@ -14,107 +14,109 @@
 
 """Transformer models."""
 
-from flax import nn
+from flax import linen as nn
 import efficient_attention
 import layers
 from flax.training.common_utils import onehot
 import jax.numpy as jnp
+from ml_collections import ConfigDict
+from typing import Tuple
 
 
 NEG_INFINITY = -10000.0
 LAYER_NORM_EPSILON = 1e-12
 
 
-def get_hidden_activation(config):
+def get_hidden_activation(config: ConfigDict):
   #TODO(kitaev): implement for other values of the config
   assert config.hidden_act == 'gelu'
   return nn.gelu
 
 
-def get_kernel_init(config):
+def get_kernel_init(config: ConfigDict):
   #TODO(kitaev): make this actually configurable
   return nn.initializers.xavier_uniform()
 
 
 class BertModel(nn.Module):
   """BERT model without any task-specific heads."""
+  config: ConfigDict
 
-  def apply(self,
-            input_ids, input_mask, type_ids, *,
-            config,
-            deterministic=False):
+  @nn.compact  
+  def __call__(self, 
+               input_ids: jnp.ndarray, 
+               input_mask: jnp.ndarray,
+               type_ids: jnp.ndarray, 
+               *,
+               deterministic: bool = False) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Applies BERT model on the inputs."""
 
+    config = self.config
     word_embeddings = nn.Embed(
-        input_ids,
-        num_embeddings=config.vocab_size,
-        features=config.hidden_size,
+        num_embeddings=config.vocab_size, 
+        features=config.hidden_size, 
         embedding_init=get_kernel_init(config),
-        name='word_embeddings')
+        name='word_embeddings')(input_ids)
     position_embeddings = layers.PositionalEncoding(
-        word_embeddings,
         max_len=config.max_position_embeddings,
         posemb_init=get_kernel_init(config),
-        name='position_embeddings')
+        name='position_embeddings')(word_embeddings)
     type_embeddings = nn.Embed(
-        type_ids,
         num_embeddings=config.type_vocab_size,
         features=config.hidden_size,
         embedding_init=get_kernel_init(config),
-        name='type_embeddings')
+        name='type_embeddings')(type_ids)
 
     embeddings = word_embeddings + position_embeddings + type_embeddings
     embeddings = nn.LayerNorm(
-        embeddings, epsilon=LAYER_NORM_EPSILON, name='embeddings_layer_norm')
-    embeddings = nn.dropout(
-        embeddings, rate=config.hidden_dropout_prob, deterministic=deterministic)
+        epsilon=LAYER_NORM_EPSILON, 
+        name='embeddings_layer_norm')(embeddings)
+    embeddings = nn.Dropout(
+        rate=config.hidden_dropout_prob)(embeddings,
+                                         deterministic=deterministic)
 
     # Transformer blocks
-    feed_forward = layers.FeedForward.partial(
+    feed_forward = layers.FeedForward(
         d_ff=config.intermediate_size,
         dropout_rate=config.hidden_dropout_prob,
         intermediate_activation=get_hidden_activation(config),
-        kernel_init=get_kernel_init(config))
-
-    attention = efficient_attention.BertSelfAttention.partial(
-        num_heads=config.num_attention_heads,
-        num_parallel_heads=None,
-        d_qkv=config.hidden_size // config.num_attention_heads,
-        attention_dropout_rate=config.attention_probs_dropout_prob,
-        output_dropout_rate=config.hidden_dropout_prob,
         kernel_init=get_kernel_init(config),
-        output_kernel_init=get_kernel_init(config))
+        name='feed_forward')
+
+    attention = nn.SelfAttention(
+        num_heads=config.num_attention_heads,
+        qkv_features=config.hidden_size,
+        dropout_rate=config.attention_probs_dropout_prob,
+        kernel_init=get_kernel_init(config),
+        deterministic=deterministic,
+        name='self_attention')
 
     hidden_states = embeddings
     mask = input_mask.astype(jnp.int32)
     for layer_num in range(config.num_hidden_layers):
       hidden_states = layers.TransformerBlock(
-        hidden_states, mask,
         feed_forward=feed_forward,
         attention=attention,
-        deterministic=deterministic,
-        name=f'encoder_layer_{layer_num}')
+        name=f'encoder_layer_{layer_num}')(hidden_states, mask, 
+                                           deterministic=deterministic)
 
     pooled_output = nn.Dense(
-        hidden_states[:, 0],
-        config.hidden_size,
         kernel_init=get_kernel_init(config),
-        name='pooler')
+        name='pooler',
+        features=config.hidden_size)(hidden_states[:, 0])
     pooled_output = jnp.tanh(pooled_output)
 
     return hidden_states, pooled_output
 
-  @nn.base.module_method
   def get_embedding_table(self, **unused_kwargs):
-    return self.get_param('word_embeddings')['embedding']
+    return self.variables['params']['word_embeddings']['embedding']
 
 
 class GatherIndexes(nn.Module):
   """Gathers the vectors at the specific positions."""
 
-  def apply(self,
-            sequence_tensor,
-            positions):
+  @nn.compact
+  def __call__(self, sequence_tensor: jnp.ndarray, positions: jnp.ndarray):
     """Applies gather indexes layer.
 
     Args:
@@ -142,20 +144,27 @@ class GatherIndexes(nn.Module):
 
 class BertForSequenceClassification(nn.Module):
   """Bert model for sequence classification."""
+  config: ConfigDict
+  n_classes: int
 
-  def apply(self,
-            input_ids, input_mask, type_ids, labels=None, *,
-            config, n_classes, deterministic=False):
+  @nn.compact
+  def __call__(self, 
+               input_ids: jnp.ndarray,
+               input_mask: jnp.ndarray,
+               type_ids: jnp.ndarray,
+               labels: jnp.ndarray = None,
+               *,
+               deterministic: bool = False):
     """Applies BERT for sequence classification."""
-    unused_sequence_output, pooled_output = BertModel(
-        input_ids, input_mask, type_ids,
-        config=config, deterministic=deterministic, name='bert')
-    pooled_output = nn.dropout(
-        pooled_output, rate=config.hidden_dropout_prob,
-        deterministic=deterministic)
+    bert = BertModel(config=self.config, name='bert')
+    _, pooled_output = bert(input_ids, input_mask, type_ids, 
+                            deterministic=deterministic)
+    pooled_output = nn.Dropout(
+        rate=self.config.hidden_dropout_prob,
+        deterministic=deterministic)(pooled_output)
     logits = layers.OutputProjection(
-        pooled_output, n_out=n_classes, kernel_init=get_kernel_init(config),
-        name='classification')
+        n_out=self.n_classes, kernel_init=get_kernel_init(self.config),
+        name='classification')(pooled_output)
 
     if labels is None:
       return logits
@@ -173,57 +182,57 @@ class BertForSequenceClassification(nn.Module):
 
 class BertForPreTraining(nn.Module):
   """Bert model for pre-training."""
+  config: ConfigDict
 
-  def apply(self,
-            input_ids, input_mask, type_ids,
-            masked_lm_positions=None,
-            masked_lm_labels=None,
-            masked_lm_weights=None,
-            next_sentence_labels=None,
-            *,
-            config, deterministic=False):
+  @nn.compact
+  def __call__(self,
+               input_ids: jnp.ndarray,
+               input_mask: jnp.ndarray,
+               type_ids: jnp.ndarray,
+               masked_lm_positions: jnp.ndarray = None,
+               masked_lm_labels: jnp.ndarray = None,
+               masked_lm_weights: jnp.ndarray = None,
+               next_sentence_labels: jnp.ndarray = None,
+               *,
+               deterministic: bool = False):
     """Applies BERT for pre-training."""
-    bert = BertModel.shared(config=config, name='bert')
+    config = self.config
+    bert = BertModel(config=config, name='bert')
     sequence_output, pooled_output = bert(
         input_ids, input_mask, type_ids, deterministic=deterministic)
     if masked_lm_positions is None:
       return sequence_output, pooled_output
 
     # Masked LM
-    masked_lm_input = GatherIndexes(sequence_output, masked_lm_positions)
+    masked_lm_input = GatherIndexes()(sequence_output, masked_lm_positions)
     masked_lm_input = nn.Dense(
-        masked_lm_input,
-        config.hidden_size,
+        features=config.hidden_size,
         kernel_init=get_kernel_init(config),
-        name='predictions_transform_dense')
+        name='predictions_transform_dense')(masked_lm_input)
     masked_lm_input = get_hidden_activation(config)(masked_lm_input)
-    masked_lm_input = nn.LayerNorm(
-        masked_lm_input,
-        epsilon=LAYER_NORM_EPSILON,
-        name='predictions_transform_layernorm')
+    masked_lm_input = nn.LayerNorm(epsilon=LAYER_NORM_EPSILON,
+        name='predictions_transform_layernorm')(masked_lm_input)
     masked_lm_logits = layers.OutputProjection(
-        masked_lm_input, kernel=bert.get_embedding_table(),
-        name='predictions_output')
+        name='predictions_output')(masked_lm_input, bert.get_embedding_table())
 
     # Next-sentence prediction
     next_sentence_logits = layers.OutputProjection(
-        pooled_output, n_out=2, kernel_init=get_kernel_init(config),
-        name='classification')
+        n_out=2, kernel_init=get_kernel_init(config),
+        name='classification')(pooled_output)
 
     if masked_lm_labels is None or next_sentence_labels is None:
       return masked_lm_logits, next_sentence_logits
     else:
-      return self._compute_metrics(
+      return BertForPreTraining.compute_metrics(
           masked_lm_logits, next_sentence_logits,
           masked_lm_labels, masked_lm_weights, next_sentence_labels)
 
-  def _compute_metrics(self,
-                       masked_lm_logits,
-                       next_sentence_logits,
-                       masked_lm_labels,
-                       masked_lm_weights,
-                       next_sentence_labels,
-                       **unused_kwargs):
+  @staticmethod
+  def compute_metrics(masked_lm_logits: jnp.ndarray,
+                      next_sentence_logits: jnp.ndarray,
+                      masked_lm_labels: jnp.ndarray,
+                      masked_lm_weights: jnp.ndarray,
+                      next_sentence_labels: jnp.ndarray):
     """Computes the pre-training loss and its components."""
     masked_lm_logits = nn.log_softmax(masked_lm_logits)
     masked_lm_labels = onehot(
@@ -244,5 +253,3 @@ class BertForPreTraining(nn.Module):
         'masked_lm_loss': masked_lm_loss,
         'next_sentence_loss': next_sentence_loss,
     }
-
-  compute_metrics = nn.base.module_method(_compute_metrics)

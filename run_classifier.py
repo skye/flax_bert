@@ -93,7 +93,13 @@ def get_output_dir(config):
   return output_dir
 
 
-def create_model(config, num_classes=2):
+def model():
+  # TODO(marcvanzee): Using the config from FLAGS here is a bit hacky, and it is
+  # better to pass it as an argument to this function.
+  return BertForSequenceClassification(FLAGS.config.model)
+
+
+def get_initial_params(config, num_classes=2):
   """Create a model, starting with a pre-trained checkpoint."""
   model_kwargs = dict(
       config=config.model,
@@ -138,24 +144,21 @@ def create_optimizer(config, model):
   return optimizer
 
 
-def compute_loss_and_metrics(model, batch, rng):
+def compute_loss_and_metrics(model, params, batch, rng):
   """Compute cross-entropy loss for classification tasks."""
-  with nn.stochastic(rng):
-    metrics = model(
-        batch['input_ids'],
-        (batch['input_ids'] > 0).astype(np.int32),
-        batch['token_type_ids'],
-        batch['label'])
+  metrics = model(params,
+                  batch['input_ids'],
+                  (batch['input_ids'] > 0).astype(np.int32),
+                  batch['token_type_ids'],
+                  batch['label'])
   return metrics['loss'], metrics
 
 
-def compute_classification_stats(model, batch):
-  with nn.stochastic(jax.random.PRNGKey(0)):
-    y = model(
-        batch['input_ids'],
-        (batch['input_ids'] > 0).astype(np.int32),
-        batch['token_type_ids'],
-        deterministic=True)
+def compute_classification_stats(model, params, batch):
+  y = model.apply(params, 
+                  batch['input_ids'],
+                  (batch['input_ids'] > 0).astype(np.int32),
+                  batch['token_type_ids'], deterministic=True)
   return {
       'idx': batch['idx'],
       'label': batch['label'],
@@ -163,7 +166,7 @@ def compute_classification_stats(model, batch):
   }
 
 
-def compute_regression_stats(model, batch):
+def compute_regression_stats(model, params, batch):
   with nn.stochastic(jax.random.PRNGKey(0)):
     y = model(
         batch['input_ids'],
@@ -229,7 +232,7 @@ def main(argv):
     train_iter = data_pipeline.get_inputs(
       split='train', batch_size=config.train_batch_size, training=True)
 
-    for step, batch in zip(range(0, num_train_steps), train_iter):
+    for _, batch in zip(range(0, num_train_steps), train_iter):
       optimizer, train_state = train_step_fn(optimizer, batch, train_state)
 
   if config.do_eval:
@@ -263,7 +266,6 @@ def main(argv):
 
   if config.do_predict:
     predict_step = training.create_eval_fn(compute_stats)
-    predict_results = []
 
     path_map = {
         ('glue', 'cola', 'test'): 'CoLA.tsv',

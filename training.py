@@ -173,7 +173,7 @@ def create_train_step(loss_and_metrics_fn, clip_grad_norm=None):
   def train_step(optimizer, batch, train_state):
     rng, new_rng = jax.random.split(train_state.rng)
     grad_fn = jax.value_and_grad(
-        lambda model: loss_and_metrics_fn(model, batch, rng), has_aux=True)
+        lambda params: loss_and_metrics_fn(params, batch, rng), has_aux=True)
     (unused_loss, metrics), grad = grad_fn(optimizer.target)
     grad = jax.lax.pmean(grad, 'batch')
     if clip_grad_norm is not None:
