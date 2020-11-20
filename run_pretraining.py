@@ -122,7 +122,7 @@ def create_optimizer(config: ConfigDict, initial_params):
 
 def compute_pretraining_loss_and_metrics(params, batch, model):
   """Compute cross-entropy loss for classification tasks."""
-  metrics = model.apply(
+  metrics = model.apply({'params': params},
       params, batch['input_ids'], (batch['input_ids'] > 0).astype(np.int32),
       batch['token_type_ids'], batch['masked_lm_positions'], 
       batch['masked_lm_ids'], batch['masked_lm_weights'], 
