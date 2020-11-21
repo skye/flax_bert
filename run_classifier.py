@@ -15,7 +15,7 @@
 """Run sequence-level classification (and regression) fine-tuning."""
 
 import datetime
-import functools
+from functools import partial
 import os
 import typing
 
@@ -26,7 +26,7 @@ import dataclasses
 from flax import nn
 from flax import optim
 import import_weights
-import modeling
+from modeling import BertForSequenceClassification
 import training
 # from flax.metrics import tensorboard
 # from flax.training import checkpoints
@@ -54,7 +54,7 @@ config_flags.DEFINE_config_file(
   'Hyperparameter configuration')
 
 
-def get_config():
+def get_config() -> ConfigDict:
   config = FLAGS.config
   hf_config = transformers.AutoConfig.from_pretrained(config.init_checkpoint)
   assert hf_config.model_type == 'bert', 'Only BERT is supported.'
@@ -76,7 +76,7 @@ def get_config():
   return config
 
 
-def get_output_dir(config):
+def get_output_dir(config: ConfigDict) -> str:
   """Get output directory location."""
   output_dir = FLAGS.output_dir
   if output_dir is None:
@@ -93,19 +93,13 @@ def get_output_dir(config):
   return output_dir
 
 
-def model():
-  # TODO(marcvanzee): Using the config from FLAGS here is a bit hacky, and it is
-  # better to pass it as an argument to this function.
-  return BertForSequenceClassification(FLAGS.config.model)
+def model(config: ConfigDict, 
+          num_classes: int) -> BertForSequenceClassification:
+  return BertForSequenceClassification(config=config, num_classes=num_classes)
 
 
-def get_initial_params(config, num_classes=2):
+def get_initial_params(config: ConfigDict, num_classes:int) -> Any:
   """Create a model, starting with a pre-trained checkpoint."""
-  model_kwargs = dict(
-      config=config.model,
-      n_classes=num_classes,
-  )
-  model_def = modeling.BertForSequenceClassification.partial(**model_kwargs)
   if config.init_checkpoint:
     initial_params = import_weights.load_params(
         init_checkpoint=config.init_checkpoint,
@@ -113,52 +107,56 @@ def get_initial_params(config, num_classes=2):
         num_attention_heads=config.model.num_attention_heads,
         num_classes=num_classes)
   else:
-    with nn.stochastic(jax.random.PRNGKey(0)):
-      _, initial_params = model_def.init_by_shape(
-          jax.random.PRNGKey(0),
-          [((1, config.max_seq_length), jnp.int32),
-           ((1, config.max_seq_length), jnp.int32),
-           ((1, config.max_seq_length), jnp.int32),
-           ((1, 1), jnp.int32)],
-          deterministic=True)
-  model = nn.Model(model_def, initial_params)
-  return model
+    seq_input = jnp.ones((1, config.max_seq_length), jnp.int32)
+    initial_params = model(config, num_classes).init(
+        jax.random.PRNGKey(0), 
+        seq_input, 
+        seq_input, 
+        seq_input, 
+        jnp.ones((1, 1), jnp.int32), 
+        deterministic=True)['params']
+  return initial_params
 
 
-def create_optimizer(config, model):
+# TODO(marcvanzee): Duplicate in run_pretraining.py. Move to training.py.
+def create_optimizer(learning_rate: float, params: Any) -> optim.Optimizer:
   common_kwargs = dict(
-    learning_rate=config.learning_rate,
+    learning_rate=learning_rate,
     beta1=0.9,
     beta2=0.999,
     eps=1e-6,
   )
-  optimizer_decay_def = optim.Adam(
-    weight_decay=0.01, **common_kwargs)
-  optimizer_no_decay_def = optim.Adam(
-    weight_decay=0.0, **common_kwargs)
+  optimizer_decay_def = optim.Adam(weight_decay=0.01, **common_kwargs)
+  optimizer_no_decay_def = optim.Adam(weight_decay=0.0, **common_kwargs)
   decay = optim.ModelParamTraversal(lambda path, _: 'bias' not in path)
   no_decay = optim.ModelParamTraversal(lambda path, _: 'bias' in path)
   optimizer_def = optim.MultiOptimizer(
     (decay, optimizer_decay_def), (no_decay, optimizer_no_decay_def))
-  optimizer = optimizer_def.create(model)
+  optimizer = optimizer_def.create(params)
   return optimizer
 
 
-def compute_loss_and_metrics(model, params, batch, rng):
+def compute_loss_and_metrics(
+    config: ConfigDict,
+    num_classes: int,
+    params: Any,
+    batch: Dict[str, jnp.ndarray]) -> Tuple[jnp.ndarray, 
+                                            Dict[str, jnp.ndarray]]:
   """Compute cross-entropy loss for classification tasks."""
-  metrics = model(params,
-                  batch['input_ids'],
-                  (batch['input_ids'] > 0).astype(np.int32),
-                  batch['token_type_ids'],
-                  batch['label'])
+  metrics = model(config, num_classes).apply({'params': params},
+      batch['input_ids'], (batch['input_ids'] > 0).astype(np.int32),
+      batch['token_type_ids'], batch['label'])
   return metrics['loss'], metrics
 
 
-def compute_classification_stats(model, params, batch):
-  y = model.apply(params, 
-                  batch['input_ids'],
-                  (batch['input_ids'] > 0).astype(np.int32),
-                  batch['token_type_ids'], deterministic=True)
+def compute_classification_stats(
+    config: ConfigDict,
+    num_classes: int,
+    params: Any, 
+    batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+  y = model(config, num_classes).apply({'params': params},
+      batch['input_ids'], (batch['input_ids'] > 0).astype(np.int32),
+      batch['token_type_ids'], deterministic=True)
   return {
       'idx': batch['idx'],
       'label': batch['label'],
@@ -166,13 +164,17 @@ def compute_classification_stats(model, params, batch):
   }
 
 
-def compute_regression_stats(model, params, batch):
-  with nn.stochastic(jax.random.PRNGKey(0)):
-    y = model(
-        batch['input_ids'],
-        (batch['input_ids'] > 0).astype(np.int32),
-        batch['token_type_ids'],
-        deterministic=True)
+def compute_regression_stats(
+    config: ConfigDict,
+    num_classes: int,
+    params: Any, 
+    batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+  y = model(config, num_classes).apply(
+      {'params': params},
+      batch['input_ids'],
+      (batch['input_ids'] > 0).astype(np.int32),
+      batch['token_type_ids'],
+      deterministic=True)
   return {
       'idx': batch['idx'],
       'label': batch['label'],
@@ -208,10 +210,10 @@ def main(argv):
     num_classes = dataset['train'].features['label'].num_classes
     compute_stats = compute_classification_stats
 
-  model = create_model(config, num_classes=num_classes)
-  optimizer = create_optimizer(config, model)
+  initial_params = get_initial_params(config, num_classes)
+  optimizer = create_optimizer(config.learning_rate, initial_params)
   optimizer = optimizer.replicate()
-  del model  # don't keep a copy of the initial model
+  del initial_params  # don't keep a copy of the initial parameters.
 
   learning_rate_fn = training.create_learning_rate_scheduler(
       factors='constant * linear_warmup * linear_decay',
@@ -227,6 +229,7 @@ def main(argv):
   train_state = train_history.initial_state()
 
   if config.do_train:
+    metrics_fn = fu
     train_step_fn = training.create_train_step(
       compute_loss_and_metrics, clip_grad_norm=1.0)
     train_iter = data_pipeline.get_inputs(

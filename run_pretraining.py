@@ -15,11 +15,11 @@
 """Run masked LM/next sentence masked_lm pre-training for BERT."""
 
 import datetime
-import functools
+from functools import partial
 import itertools
 import json
 import os
-from typing import Any
+from typing import Any, Dict, Tuple
 
 from absl import app
 from absl import flags
@@ -56,7 +56,7 @@ config_flags.DEFINE_config_file(
   'Hyperparameter configuration')
 
 
-def get_output_dir(config: ConfigDict):
+def get_output_dir(config: ConfigDict) -> str:
   """Get output directory location."""
   del config
   output_dir = FLAGS.output_dir
@@ -72,7 +72,11 @@ def get_output_dir(config: ConfigDict):
   return output_dir
 
 
-def get_model_and_params(config: ConfigDict, rng: PRNGKey):
+def model(config: ConfigDict) -> BertForPreTraining:
+  return BertForPreTraining(config)
+
+
+def get_initial_params(config: ConfigDict, rng: PRNGKey) -> Any:
   """Create a model, starting with a pre-trained checkpoint."""
   if config.init_checkpoint:
     initial_params = import_weights.load_params(
@@ -85,8 +89,7 @@ def get_model_and_params(config: ConfigDict, rng: PRNGKey):
     rngs = {'params': rng, 'dropout': dropout_rng}
     seq_input = jnp.ones((1, config.max_seq_length), jnp.int32)
     predict_input = jnp.ones((1, config.max_predictions_per_seq), jnp.int32)
-    model = BertForPreTraining(FLAGS.config.model)
-    initial_params = model.init(
+    initial_params = model(config.model).init(
         rngs, seq_input, seq_input, seq_input, predict_input,
         deterministic=True)['params']
     def fixup_for_tpu(x, i=[0]):
@@ -100,12 +103,13 @@ def get_model_and_params(config: ConfigDict, rng: PRNGKey):
       else:
         return x
     initial_params = jax.tree_map(fixup_for_tpu, initial_params)
-  return model, initial_params
+  return initial_params
 
 
-def create_optimizer(config: ConfigDict, initial_params):
+# TODO(marcvanzee): Duplicate in run_classifier.py. Move to training.py.
+def create_optimizer(learning_rate: float, params: Any) -> optim.Optimizer:
   common_kwargs = dict(
-    learning_rate=config.learning_rate,
+    learning_rate=learning_rate,
     beta1=0.9,
     beta2=0.999,
     eps=1e-6,
@@ -116,13 +120,17 @@ def create_optimizer(config: ConfigDict, initial_params):
   no_decay = optim.ModelParamTraversal(lambda path, _: 'bias' in path)
   optimizer_def = optim.MultiOptimizer(
     (decay, optimizer_decay_def), (no_decay, optimizer_no_decay_def))
-  optimizer = optimizer_def.create(initial_params)
+  optimizer = optimizer_def.create(params)
   return optimizer
 
 
-def compute_pretraining_loss_and_metrics(params, batch, model):
+def compute_pretraining_loss_and_metrics(
+    config: ConfigDict,
+    params: Any,
+    batch: Dict[str, jnp.ndarray]) -> Tuple[jnp.ndarray, 
+                                            Dict[str, jnp.ndarray]]:
   """Compute cross-entropy loss for classification tasks."""
-  metrics = model.apply({'params': params},
+  metrics = model(config).apply({'params': params},
       params, batch['input_ids'], (batch['input_ids'] > 0).astype(np.int32),
       batch['token_type_ids'], batch['masked_lm_positions'], 
       batch['masked_lm_ids'], batch['masked_lm_weights'], 
@@ -130,9 +138,13 @@ def compute_pretraining_loss_and_metrics(params, batch, model):
   return metrics['loss'], metrics
 
 
-def compute_pretraining_stats(params, batch, model):
+def compute_pretraining_stats(
+    config: ConfigDict,
+    params: Any, 
+    batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
   """Used for computing eval metrics during pre-training."""
-  masked_lm_logits, next_sentence_logits = model.apply({'params': params},
+  masked_lm_logits, next_sentence_logits = model(config).apply(
+      {'params': params},
       batch['input_ids'],
       (batch['input_ids'] > 0).astype(np.int32),
       batch['token_type_ids'],
@@ -167,8 +179,8 @@ def main(argv):
   config = FLAGS.config
 
   rng = random.PRNGKey(0)
-  model, initial_params = get_model_and_params(config, rng)
-  optimizer = create_optimizer(config, initial_params)
+  initial_params = get_initial_params(config, rng)
+  optimizer = create_optimizer(config.learning_rate, initial_params)
 
   output_dir = get_output_dir(config)
   gfile.makedirs(output_dir)
@@ -225,8 +237,7 @@ def main(argv):
   if config.do_train:
     train_iter = data_pipeline.get_inputs(
         batch_size=config.train_batch_size, training=True)
-    metrics_fn = functools.partial(compute_pretraining_loss_and_metrics, 
-                                   model=model)
+    metrics_fn = partial(compute_pretraining_loss_and_metrics, config=config)
     train_step_fn = training.create_train_step(metrics_fn, clip_grad_norm=1.0)
 
     for step, batch in zip(range(start_step, config.num_train_steps),
@@ -245,7 +256,7 @@ def main(argv):
   if config.do_eval:
     eval_iter = data_pipeline.get_inputs(batch_size=config.eval_batch_size)
     eval_iter = itertools.islice(eval_iter, config.max_eval_steps)
-    stats_fn = functools.partial(compute_pretraining_stats, model=model)
+    stats_fn = partial(compute_pretraining_stats, config=config)
     eval_fn = training.create_eval_fn(stats_fn, sample_feature_name='input_ids')
     eval_stats = eval_fn(optimizer, eval_iter)
 
