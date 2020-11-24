@@ -66,7 +66,7 @@ def get_pretrained_state_dict(pretrained_model_name_or_path, *model_args, **kwar
       archive_file = hf_bucket_url(
         pretrained_model_name_or_path,
         filename=WEIGHTS_NAME,
-        use_cdn=use_cdn,
+        # use_cdn=use_cdn,
         mirror=mirror,
       )
 

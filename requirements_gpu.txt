@@ -1,0 +1,6 @@
+datasets==1.1.2
+flax==0.2.2
+jax==0.2.6
+ml-collections==0.1.0
+tokenizers==0.9.3
+transformers==3.5.1
