@@ -27,6 +27,8 @@ from tensorflow.io import gfile
 
 from transformers import BertTokenizerFast
 
+import time
+
 def get_config(init_checkpoint, dataset):
   hf_config = transformers.AutoConfig.from_pretrained(init_checkpoint)
   model_config = ml_collections.ConfigDict({
@@ -97,8 +99,9 @@ def create_optimizer(config, model, initial_params):
   return optimizer
 
 
-def get_num_train_steps(config, dataset):
-  num_train_examples = len(dataset['train'])
+def get_num_train_steps(config, data_pipeline):
+  num_train_examples = len(data_pipeline.dataset['train'])
+  print(f'Num train examples: {num_train_examples}')
   num_train_steps = int(
       num_train_examples * config.num_train_epochs // config.train_batch_size)
   return num_train_steps
@@ -143,28 +146,35 @@ def compute_classification_stats(model, batch):
 
 def run_train(optimizer, data_pipeline, tokenizer, config):
   tokenizer.model_max_length = config.max_seq_length
-  num_train_steps = get_num_train_steps(config, data_pipeline.dataset)
+  num_train_steps = get_num_train_steps(config, data_pipeline)
 
   learning_rate_fn = get_learning_rate_fn(config, num_train_steps)
   train_history = training.TrainStateHistory(learning_rate_fn)
   train_state = train_history.initial_state()
 
+  t0 = time.time()
   train_step_fn = training.create_train_step(
     compute_loss_and_metrics, clip_grad_norm=1.0)
   train_iter = data_pipeline.get_inputs(
     split='train', batch_size=config.train_batch_size, training=True)
+  print(f'Input pipeline: {time.time()-t0}')
 
-  print(f'\nStarting training on {config.dataset_name} for {num_train_steps} '
-        f'steps ({config.num_train_epochs:.0f} epochs)...\n')
+  if jax.host_id() == 0:
+    print(f'\nStarting training on {config.dataset_name} for {num_train_steps} '
+          f'steps ({config.num_train_epochs:.0f} epochs)...\n')
 
   for _, batch in zip(range(0, num_train_steps), train_iter):
     optimizer, train_state = train_step_fn(optimizer, batch, train_state)
 
-  print('\nFinished training.')
+  if jax.host_id() == 0:
+    print('\nFinished training.')
 
   return optimizer
 
 def run_eval(optimizer, data_pipeline, config):
+  # if jax.host_id() != 0:
+  #    return
+
   eval_step = training.create_eval_fn(compute_classification_stats)
 
   if config.dataset_name == 'mnli':

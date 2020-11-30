@@ -18,6 +18,7 @@ import datasets
 import numpy as np
 import random
 import torch
+import jax
 
 
 class DataPipeline:
@@ -26,7 +27,7 @@ class DataPipeline:
 
   def get_inputs(self, batch_size, split=None, training=False):
     dataloader = torch.utils.data.DataLoader(
-      self.dataset if split is None else self.dataset[split],
+      self.dataset[split],
       collate_fn=self.collate,
       batch_size=batch_size,
       drop_last=training,
@@ -49,6 +50,11 @@ class ClassificationDataPipeline(DataPipeline):
   def __init__(self, dataset, tokenizer):
     self.tokenizer = tokenizer
 
+    # shard train here already to avoid unnecessary tokenization.
+    dataset['train'] = dataset['train'].shard(jax.host_count(), jax.host_id())
+
+    print(f'Keys: {dataset.keys()}')
+    print(f'Train size: {len(dataset["train"])}')
     if isinstance(dataset, dict):
       single_split = dataset['train']
     else:
@@ -66,6 +72,7 @@ class ClassificationDataPipeline(DataPipeline):
     else:
       tokenize = lambda example: self.tokenizer(
         example[name_a], truncation=True)
+    
     mapped_dataset = dataset.map(tokenize, batched=True)
     mapped_dataset.set_format('numpy', columns=[
       'idx', 'input_ids', 'token_type_ids', 'attention_mask', 'label'])
