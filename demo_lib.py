@@ -23,7 +23,7 @@ import import_weights
 from flax import nn
 from flax import optim
 
-from tensorflow.io import gfile
+# from tensorflow.io import gfile
 
 from transformers import BertTokenizerFast
 
